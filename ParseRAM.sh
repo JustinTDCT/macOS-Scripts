@@ -1,7 +1,7 @@
 #!/bin/bash
 clear
 
-# Exit on any error
+# Exit on error
 set -e
 
 if [ -z "$1" ]; then
@@ -13,18 +13,21 @@ MEMFILE="$1"
 BASENAME=$(basename "$MEMFILE")
 FILETIME=$(stat -f "%SB" -t "%Y-%m-%d_%H_%M" "$MEMFILE")
 OUTDIR="DUMP_${BASENAME}_${FILETIME}"
+TXTDIR="$OUTDIR/TXT"
+CSVDIR="$OUTDIR/CSV"
 
-mkdir -p "$OUTDIR"
-# Plugins known to require additional arguments — skip in full scan
+mkdir -p "$TXTDIR" "$CSVDIR"
+
+# Plugins requiring manual input — skip
 skip_plugins=(
   "regexscan.RegExScan"
-  "windows.vadyarascan.VadYaraScan"  # requires --yara-rules
-  "windows.strings.Strings"          # requires strings file
-  "windows.pedump.PEDump"            # requires --physical/--virtual address
+  "windows.vadyarascan.VadYaraScan"
+  "windows.strings.Strings"
+  "windows.pedump.PEDump"
   "timeliner.Timeliner"
 )
-# Plugins to run
 
+# FULL plugin list (same as your original)
 plugins=(
   "regexscan.RegExScan"
   "timeliner.Timeliner"
@@ -76,7 +79,7 @@ plugins=(
   "windows.malware.svcdiff.SvcDiff"
   "windows.malware.unhooked_system_calls.UnhookedSystemCalls"
   "windows.mbrscan.MBRScan"
-  # "windows.memmap.Memmap"  # ⛔ Disabled: Slow — uncomment to enable
+  # "windows.memmap.Memmap"  # ⛔ Optional: slow
   "windows.mftscan.ADS"
   "windows.mftscan.MFTScan"
   "windows.mftscan.ResidentData"
@@ -139,7 +142,7 @@ total=${#plugins[@]}
 count=1
 
 echo "🧪 Starting Volatility3 scan on: $MEMFILE"
-echo "📂 Output will be saved to: $OUTDIR"
+echo "📂 Output saved to: $OUTDIR"
 echo "📦 Total plugins to run: $total"
 echo ""
 
@@ -150,7 +153,7 @@ spinner() {
   while kill -0 "$pid" 2>/dev/null; do
     local temp=${spinstr#?}
     printf " [%c]  " "$spinstr"
-    local spinstr=$temp${spinstr%"$temp"}
+    spinstr=$temp${spinstr%"$temp"}
     sleep $delay
     printf "\b\b\b\b\b\b"
   done
@@ -163,28 +166,32 @@ for plugin in "${plugins[@]}"; do
     continue
   fi
 
-  filename="${plugin//./_}.csv"
+  safe_name="${plugin//./_}"
+  csv_file="$CSVDIR/${safe_name}.csv"
+  txt_file="$TXTDIR/${safe_name}.txt"
+
   echo -n "[$count/$total] Running: $plugin"
 
-  # Launch plugin in background
-  vol -f "$MEMFILE" --renderer=csv $plugin > "$OUTDIR/$filename" 2>> "$OUTDIR/ScanErrors.log" &
+  # Run plugin and save CSV
+  vol -f "$MEMFILE" --renderer=csv "$plugin" > "$csv_file" 2>> "$OUTDIR/ScanErrors.log" &
   pid=$!
-
-  # Show spinner while waiting
   spinner $pid
+  wait $pid
+  exit_code=$?
 
-  # Check result
-if [[ $exit_code -eq 0 ]]; then
-  echo " ✅ Completed"
-else
-  echo " ❌ Failed (code $exit_code)"
-  echo "[!] $plugin failed with exit code $exit_code" >> "$OUTDIR/ScanErrors.log"
-fi  
-
+  if [[ $exit_code -eq 0 ]]; then
+    column -s, -t < "$csv_file" > "$txt_file"
+    echo " ✅"
+  else
+    echo " ❌ (code $exit_code)"
+    echo "[!] $plugin failed with code $exit_code" >> "$OUTDIR/ScanErrors.log"
+    touch "$csv_file" "$txt_file"
+  fi
 
   ((count++))
 done
 
 echo ""
 echo "✅ All plugin scans complete."
-echo "📁 Output saved to: $OUTDIR"
+echo "📁 Text results: $TXTDIR"
+echo "📁 CSV results:  $CSVDIR"
