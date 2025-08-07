@@ -18,8 +18,8 @@ CSVDIR="$OUTDIR/CSV"
 
 mkdir -p "$TXTDIR" "$CSVDIR"
 
-# Plugins requiring manual input — skip
-skip_plugins=(
+# Plugins that require special arguments (skip)
+skip_plugins_manual=(
   "regexscan.RegExScan"
   "windows.vadyarascan.VadYaraScan"
   "windows.strings.Strings"
@@ -27,7 +27,7 @@ skip_plugins=(
   "timeliner.Timeliner"
 )
 
-# FULL plugin list (same as your original)
+# Full plugin list (minus "windows.cmdscan.CmdScan", which doesn't exist in v2.26.2)
 plugins=(
   "regexscan.RegExScan"
   "timeliner.Timeliner"
@@ -37,7 +37,6 @@ plugins=(
   "windows.cachedump.Cachedump"
   "windows.callbacks.Callbacks"
   "windows.cmdline.CmdLine"
-  "windows.cmdscan.CmdScan"
   "windows.consoles.Consoles"
   "windows.crashinfo.Crashinfo"
   "windows.debugregisters.DebugRegisters"
@@ -79,7 +78,6 @@ plugins=(
   "windows.malware.svcdiff.SvcDiff"
   "windows.malware.unhooked_system_calls.UnhookedSystemCalls"
   "windows.mbrscan.MBRScan"
-  # "windows.memmap.Memmap"  # ⛔ Optional: slow
   "windows.mftscan.ADS"
   "windows.mftscan.MFTScan"
   "windows.mftscan.ResidentData"
@@ -142,26 +140,34 @@ total=${#plugins[@]}
 count=1
 
 echo "🧪 Starting Volatility3 scan on: $MEMFILE"
-echo "📂 Output saved to: $OUTDIR"
+echo "📂 Output will be saved to: $OUTDIR"
 echo "📦 Total plugins to run: $total"
 echo ""
 
 spinner() {
   local pid=$1
   local delay=0.1
-  local spinstr='|/-\'
+  local spinstr='|/-\\'
   while kill -0 "$pid" 2>/dev/null; do
-    local temp=${spinstr#?}
-    printf " [%c]  " "$spinstr"
-    spinstr=$temp${spinstr%"$temp"}
-    sleep $delay
-    printf "\b\b\b\b\b\b"
+    for ((i = 0; i < ${#spinstr}; i++)); do
+      printf "\r[%3d/%3d] Running: %-50s [%c]" "$count" "$total" "$plugin" "${spinstr:$i:1}"
+      sleep $delay
+    done
   done
+  printf "\r%*s\r" $(tput cols) ""  # clear line
 }
 
 for plugin in "${plugins[@]}"; do
-  if [[ " ${skip_plugins[*]} " == *" $plugin "* ]]; then
-    echo "[SKIP] $plugin requires manual parameters"
+  if [[ " ${skip_plugins_manual[*]} " == *" $plugin "* ]]; then
+    printf "[SKIP] %-55s requires manual parameters\n" "$plugin"
+    ((count++))
+    continue
+  fi
+
+  # Check if plugin is available
+  if ! vol -h 2>&1 | grep -qw "$plugin"; then
+    printf "[SKIP] %-55s is not supported in this version of Volatility\n" "$plugin"
+    echo "[!] Plugin not found: $plugin" >> "$OUTDIR/ScanErrors.log"
     ((count++))
     continue
   fi
@@ -170,9 +176,6 @@ for plugin in "${plugins[@]}"; do
   csv_file="$CSVDIR/${safe_name}.csv"
   txt_file="$TXTDIR/${safe_name}.txt"
 
-  echo -n "[$count/$total] Running: $plugin"
-
-  # Run plugin and save CSV
   vol -f "$MEMFILE" --renderer=csv "$plugin" > "$csv_file" 2>> "$OUTDIR/ScanErrors.log" &
   pid=$!
   spinner $pid
@@ -180,11 +183,14 @@ for plugin in "${plugins[@]}"; do
   exit_code=$?
 
   if [[ $exit_code -eq 0 ]]; then
-    column -s, -t < "$csv_file" > "$txt_file"
-    echo " ✅"
+    if ! column -s, -t < "$csv_file" > "$txt_file" 2>/dev/null; then
+      echo "[!] column failed on $plugin — copying raw CSV as TXT instead" >> "$OUTDIR/ScanErrors.log"
+      cp "$csv_file" "$txt_file"
+    fi
+    printf "[%3d/%3d] ✅ %s\n" "$count" "$total" "$plugin"
   else
-    echo " ❌ (code $exit_code)"
-    echo "[!] $plugin failed with code $exit_code" >> "$OUTDIR/ScanErrors.log"
+    printf "[%3d/%3d] ❌ %s (exit code %d)\n" "$count" "$total" "$plugin" "$exit_code"
+    echo "[!] $plugin failed with exit code $exit_code" >> "$OUTDIR/ScanErrors.log"
     touch "$csv_file" "$txt_file"
   fi
 
@@ -193,5 +199,5 @@ done
 
 echo ""
 echo "✅ All plugin scans complete."
-echo "📁 Text results: $TXTDIR"
-echo "📁 CSV results:  $CSVDIR"
+echo "📁 Text results saved to: $TXTDIR"
+echo "📁 CSV results saved to:  $CSVDIR"
