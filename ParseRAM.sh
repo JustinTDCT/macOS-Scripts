@@ -1,8 +1,8 @@
 #!/bin/bash
 clear
 
-# Exit on error
-set -e
+# Don't exit on failure — we want to continue on plugin errors
+set +e
 
 if [ -z "$1" ]; then
   echo "Usage: $0 memory_dump.raw"
@@ -18,7 +18,10 @@ CSVDIR="$OUTDIR/CSV"
 
 mkdir -p "$TXTDIR" "$CSVDIR"
 
-# Plugins that require special arguments (skip)
+MAX_PARALLEL=6
+job_count=0
+
+# Plugins requiring manual arguments
 skip_plugins_manual=(
   "regexscan.RegExScan"
   "windows.vadyarascan.VadYaraScan"
@@ -27,7 +30,22 @@ skip_plugins_manual=(
   "timeliner.Timeliner"
 )
 
-# Full plugin list (minus "windows.cmdscan.CmdScan", which doesn't exist in v2.26.2)
+# Spinner
+show_spinner() {
+  local pid=$1
+  local count=$2
+  local total=$3
+  local plugin=$4
+  local spin='-\|/'
+  i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r[%03d/%03d] Running: %-50s [%c]" "$count" "$total" "$plugin" "${spin:$i:1}"
+    sleep 0.1
+    ((i=(i+1)%4))
+  done
+}
+
+# Full plugin list
 plugins=(
   "regexscan.RegExScan"
   "timeliner.Timeliner"
@@ -144,19 +162,6 @@ echo "📂 Output will be saved to: $OUTDIR"
 echo "📦 Total plugins to run: $total"
 echo ""
 
-spinner() {
-  local pid=$1
-  local delay=0.1
-  local spinstr='|/-\\'
-  while kill -0 "$pid" 2>/dev/null; do
-    for ((i = 0; i < ${#spinstr}; i++)); do
-      printf "\r[%3d/%3d] Running: %-50s [%c]" "$count" "$total" "$plugin" "${spinstr:$i:1}"
-      sleep $delay
-    done
-  done
-  printf "\r%*s\r" $(tput cols) ""  # clear line
-}
-
 for plugin in "${plugins[@]}"; do
   if [[ " ${skip_plugins_manual[*]} " == *" $plugin "* ]]; then
     printf "[SKIP] %-55s requires manual parameters\n" "$plugin"
@@ -164,9 +169,8 @@ for plugin in "${plugins[@]}"; do
     continue
   fi
 
-  # Check if plugin is available
   if ! vol -h 2>&1 | grep -qw "$plugin"; then
-    printf "[SKIP] %-55s is not supported in this version of Volatility\n" "$plugin"
+    printf "[SKIP] %-55s is not supported in this Volatility version\n" "$plugin"
     echo "[!] Plugin not found: $plugin" >> "$OUTDIR/ScanErrors.log"
     ((count++))
     continue
@@ -175,27 +179,47 @@ for plugin in "${plugins[@]}"; do
   safe_name="${plugin//./_}"
   csv_file="$CSVDIR/${safe_name}.csv"
   txt_file="$TXTDIR/${safe_name}.txt"
+  SECONDS_BEFORE=$(date +%s)
 
-  vol -f "$MEMFILE" --renderer=csv "$plugin" > "$csv_file" 2>> "$OUTDIR/ScanErrors.log" &
-  pid=$!
-  spinner $pid
-  wait $pid
-  exit_code=$?
-
-  if [[ $exit_code -eq 0 ]]; then
-    if ! column -s, -t < "$csv_file" > "$txt_file" 2>/dev/null; then
-      echo "[!] column failed on $plugin — copying raw CSV as TXT instead" >> "$OUTDIR/ScanErrors.log"
-      cp "$csv_file" "$txt_file"
+  (
+    status_icon="✅"
+    status_text="OK"
+    if vol -f "$MEMFILE" --renderer=csv "$plugin" > "$csv_file" 2>> "$OUTDIR/ScanErrors.log"; then
+      if ! column -s, -t < "$csv_file" > "$txt_file" 2>/dev/null; then
+        echo "[!] column failed on $plugin — copying raw CSV" >> "$OUTDIR/ScanErrors.log"
+        cp "$csv_file" "$txt_file"
+        status_icon="⚠️ "
+        status_text="Partial"
+      fi
+    else
+      echo "[!] $plugin failed to execute." >> "$OUTDIR/ScanErrors.log"
+      touch "$csv_file" "$txt_file"
+      status_icon="❌"
+      status_text="Error"
     fi
-    printf "[%3d/%3d] ✅ %s\n" "$count" "$total" "$plugin"
-  else
-    printf "[%3d/%3d] ❌ %s (exit code %d)\n" "$count" "$total" "$plugin" "$exit_code"
-    echo "[!] $plugin failed with exit code $exit_code" >> "$OUTDIR/ScanErrors.log"
-    touch "$csv_file" "$txt_file"
+    SECONDS_AFTER=$(date +%s)
+    DURATION=$(echo "$SECONDS_AFTER - $SECONDS_BEFORE" | bc)
+    printf "\r[%03d/%03d] %s %-45s (%.2fs - %s)\n" "$count" "$total" "$status_icon" "$plugin" "$DURATION" "$status_text"
+  ) &
+  pid=$!
+
+  show_spinner $pid "$count" "$total" "$plugin"
+
+  ((job_count++))
+  if (( job_count >= MAX_PARALLEL )); then
+    while :; do
+      running_jobs=$(jobs -r | wc -l | tr -d ' ')
+      if (( running_jobs < MAX_PARALLEL )); then
+        break
+      fi
+      sleep 1
+    done
   fi
 
   ((count++))
 done
+
+wait
 
 echo ""
 echo "✅ All plugin scans complete."
